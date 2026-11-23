@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
 [dependencies]
 aes = "0.9.4"
 cbc = { version = "0.2.1", features = ["alloc"] }
