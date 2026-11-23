@@ -1,0 +1,51 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            binary: wf-api-rust
+            asset: wf-api-rust-linux-x86_64
+          - os: windows-latest
+            binary: wf-api-rust.exe
+            asset: wf-api-rust-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update Rust
+        run: rustup update stable --no-self-update
+      - name: Build
+        run: cargo +stable build --release --locked
+      - name: Prepare release asset
+        shell: bash
+        run: cp "target/release/${{ matrix.binary }}" "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" assets/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
