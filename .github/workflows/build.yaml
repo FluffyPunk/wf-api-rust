@@ -21,10 +21,10 @@ jobs:
         include:
           - os: ubuntu-22.04
             binary: wf-api-rust
-            asset: wf-api-rust-linux-x86_64
+            asset: wf-api-linux
           - os: windows-latest
             binary: wf-api-rust.exe
-            asset: wf-api-rust-windows-x86_64.exe
+            asset: wf-api-windows.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
