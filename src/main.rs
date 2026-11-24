@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -20,76 +19,107 @@ const NONCE_PREFIX: &[u8; 7] = b"&nonce=";
 // pattern also matches a URL-template string baked into the game binary
 // (used to build requests with extra parameters), which has unrelated text
 // instead of a real ID and no nonce digits. Validating the shape rejects
-// that false positive without needing several identical occurrences, which
-// isn't guaranteed to exist in memory at scan time.
-const REQUIRED_CONFIRMATIONS: u32 = 1;
+// that false positive, so the first valid occurrence is accepted.
+
+/// Bytes scanned per read. Bounds peak memory use regardless of how large
+/// the target's regions are, and lets one unreadable chunk be skipped without
+/// losing the rest of its region.
+const CHUNK_SIZE: usize = 4 << 20;
+/// Nonces are u64s (at most 20 digits); leave headroom anyway.
+const MAX_NONCE_DIGITS: usize = 32;
+/// Bytes needed from the start of a match to parse it completely. Consecutive
+/// chunks overlap by this much so matches straddling a boundary aren't lost.
+const MATCH_SPAN: usize = PATTERN.len() + ACCOUNT_ID_LEN + NONCE_PREFIX.len() + MAX_NONCE_DIGITS;
 
 fn is_plausible_account_id(bytes: &[u8]) -> bool {
     bytes.len() == ACCOUNT_ID_LEN && bytes.iter().all(u8::is_ascii_hexdigit)
 }
 
+/// Parses `?accountId=<24 hex chars><7 bytes><digits>` from the start of
+/// `bytes` (the caller has already matched `PATTERN`), returning the account
+/// ID and nonce digits.
+fn parse_authz(bytes: &[u8]) -> Option<(&str, &str)> {
+    let id = bytes.get(PATTERN.len()..PATTERN.len() + ACCOUNT_ID_LEN)?;
+    if !is_plausible_account_id(id) {
+        return None;
+    }
+    let nonce = bytes.get(PATTERN.len() + ACCOUNT_ID_LEN + NONCE_PREFIX.len()..)?;
+    let digits = nonce.iter().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    // Both slices are ASCII (validated above), so these can't fail.
+    Some((
+        std::str::from_utf8(id).ok()?,
+        std::str::from_utf8(&nonce[..digits]).ok()?,
+    ))
+}
+
 #[allow(non_snake_case)]
-fn gruzzleAuthz(mod_: &mut ProcessHandle) -> Option<String> {
+fn gruzzleAuthz(mod_: &ProcessHandle) -> Option<String> {
     print!("Gruzzling");
     let _ = std::io::stdout().flush();
 
-    let mut candidates: HashMap<String, u32> = HashMap::new();
     let regions = mod_.regions();
-    let mut regions_read = 0u32;
+    let mut chunks_read = 0u32;
     let mut matches_found = 0u32;
+    // Reused across all chunks so only one allocation of this size is made.
+    let mut buf = Vec::new();
     for region in &regions {
-        let Some(data) = mod_.read_vec(region.base, region.size) else {
-            continue;
-        };
-        regions_read += 1;
+        let end = region.base.saturating_add(region.size);
+        let mut pos = region.base;
+        while pos < end {
+            let scan_len = CHUNK_SIZE.min(end - pos);
+            let read_len = (scan_len + MATCH_SPAN).min(end - pos);
+            let chunk_base = pos;
+            pos += scan_len;
 
-        // Unlike upstream's `externalScan` (first hit per region only), we
-        // check every occurrence in the region: a false positive earlier in
-        // the same region (e.g. a URL-template string) could otherwise hide
-        // a genuine, later one.
-        for match_offset in memchr::memmem::find_iter(&data, PATTERN) {
-            matches_found += 1;
-
-            let account_id_addr = region.base + match_offset + PATTERN.len();
-            let Some(account_id_bytes) = mod_.read_vec(account_id_addr, ACCOUNT_ID_LEN) else {
-                continue;
-            };
-            if !is_plausible_account_id(&account_id_bytes) {
+            buf.resize(read_len, 0);
+            if mod_.read(chunk_base, &mut buf).is_err() {
                 continue;
             }
-            let account_id = String::from_utf8_lossy(&account_id_bytes);
+            chunks_read += 1;
 
-            let mut authz = format!("?accountId={account_id}&nonce=");
-            let mut addr = account_id_addr + ACCOUNT_ID_LEN + NONCE_PREFIX.len();
-            let mut nonce_digits = 0u32;
-            while let Some(c) = mod_.read_u8(addr) {
-                addr += 1;
-                if c.is_ascii_digit() {
-                    authz.push(c as char);
-                    nonce_digits += 1;
-                } else {
+            // Unlike upstream's `externalScan` (first hit per region only), we
+            // check every occurrence: a false positive earlier in the same
+            // region (e.g. a URL-template string) could otherwise hide a
+            // genuine, later one.
+            for offset in memchr::memmem::find_iter(&buf, PATTERN) {
+                // Matches in the overlap tail belong to the next chunk.
+                if offset >= scan_len {
                     break;
                 }
-            }
-            if nonce_digits == 0 {
-                continue;
-            }
+                matches_found += 1;
 
-            eprintln!(
-                "\n[debug] match #{matches_found} @ {account_id_addr:#x} (region {:#x}+{:#x}): {authz}",
-                region.base, region.size
-            );
+                // Parse straight from the buffer. Only a match right at the
+                // end of a region needs another read, which may extend into
+                // the adjacent mapping.
+                let in_buf = &buf[offset..];
+                let extra;
+                let bytes = if in_buf.len() >= MATCH_SPAN {
+                    in_buf
+                } else {
+                    extra = mod_.read_vec(chunk_base + offset, MATCH_SPAN);
+                    extra.as_deref().unwrap_or(in_buf)
+                };
+                let Some((account_id, nonce)) = parse_authz(bytes) else {
+                    continue;
+                };
+                let authz = format!("?accountId={account_id}&nonce={nonce}");
 
-            let count = candidates.entry(authz.clone()).or_insert(0);
-            *count += 1;
-            if *count == REQUIRED_CONFIRMATIONS {
+                eprintln!(
+                    "\n[debug] match #{matches_found} @ {:#x} (region {:#x}+{:#x}): {authz}",
+                    chunk_base + offset,
+                    region.base,
+                    region.size
+                );
                 println!(" The crumbs have been gruzzled.");
                 return Some(authz);
             }
         }
     }
     eprintln!(
-        "[debug] {} regions total, {regions_read} read successfully, {matches_found} pattern matches",
+        "[debug] {} regions total, {chunks_read} chunks read successfully, {matches_found} pattern matches",
         regions.len()
     );
     println!(" Failed to gruzzle the crumbs.");
@@ -130,7 +160,7 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let mut mod_ = match ProcessHandle::open(pid) {
+    let mod_ = match ProcessHandle::open(pid) {
         Ok(mod_) => mod_,
         Err(e) => {
             report_access_error("Failed to open process", &e);
@@ -145,7 +175,7 @@ fn main() -> ExitCode {
         return ExitCode::from(4);
     }
 
-    let Some(authz) = gruzzleAuthz(&mut mod_) else {
+    let Some(authz) = gruzzleAuthz(&mod_) else {
         pause();
         return ExitCode::from(3);
     };
@@ -208,6 +238,31 @@ mod tests {
         assert!(!is_plausible_account_id(b"short"));
     }
 
+    // `parse_authz` only skips `PATTERN`'s length, so these inputs use an
+    // upper-case look-alike prefix. That keeps any complete authz string out
+    // of the test binary's memory, which the self-scan test below would
+    // otherwise find before its own fixture.
+    #[test]
+    fn parse_authz_extracts_id_and_nonce() {
+        assert_eq!(
+            parse_authz(b"?ACCOUNTID=fedcba9876543210fedcba98&nonce=42&x"),
+            Some(("fedcba9876543210fedcba98", "42"))
+        );
+    }
+
+    #[test]
+    fn parse_authz_rejects_missing_nonce_and_truncation() {
+        assert_eq!(
+            parse_authz(b"?ACCOUNTID=fedcba9876543210fedcba98&nonce=&"),
+            None
+        );
+        assert_eq!(
+            parse_authz(b"?ACCOUNTID=fedcba9876543210fedcba98&non"),
+            None
+        );
+        assert_eq!(parse_authz(b"?ACCOUNTID=fedcba9876"), None);
+    }
+
     // Regression test: a single structurally-valid occurrence must be
     // enough to succeed, since the live buffer isn't guaranteed to be
     // duplicated three times in memory the way the original heuristic
@@ -219,8 +274,8 @@ mod tests {
             b"noise before ?accountId=0123456789abcdef01234567&nonce=123456789 trailing noise";
 
         let pid = std::process::id();
-        let mut handle = ProcessHandle::open(pid).expect("should open own process");
-        let authz = gruzzleAuthz(&mut handle).expect("should find the embedded candidate");
+        let handle = ProcessHandle::open(pid).expect("should open own process");
+        let authz = gruzzleAuthz(&handle).expect("should find the embedded candidate");
         assert_eq!(authz, "?accountId=0123456789abcdef01234567&nonce=123456789");
     }
 }

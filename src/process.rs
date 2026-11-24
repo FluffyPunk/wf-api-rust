@@ -18,8 +18,13 @@ pub struct Region {
 /// Linux truncates process names to 15 characters, which is why callers
 /// typically pass both the full Windows name and a shortened fallback.
 pub fn find_pid(candidates: &[&str]) -> Option<u32> {
-    let mut system = sysinfo::System::new_all().ok()?;
-    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    // Only names and PIDs are needed, so skip CPU/memory/etc. collection.
+    let mut system = sysinfo::System::new().ok()?;
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
     for name in candidates {
         if let Some(process) = system.processes_by_exact_name(OsStr::new(name)).next() {
             return Some(process.pid().as_u32());
@@ -56,7 +61,7 @@ mod imp {
             }
         }
 
-        pub fn regions(&mut self) -> Vec<Region> {
+        pub fn regions(&self) -> Vec<Region> {
             let mut regions = Vec::new();
             let mut address: usize = 0;
             loop {
@@ -90,7 +95,7 @@ mod imp {
             regions
         }
 
-        pub fn read(&mut self, address: usize, buf: &mut [u8]) -> std::io::Result<()> {
+        pub fn read(&self, address: usize, buf: &mut [u8]) -> std::io::Result<()> {
             let mut bytes_read = 0usize;
             let ok = unsafe {
                 ReadProcessMemory(
@@ -123,7 +128,7 @@ mod imp {
 mod imp {
     use super::Region;
     use std::fs::{File, OpenOptions};
-    use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::FileExt;
 
     pub struct ProcessHandle {
         pid: u32,
@@ -136,7 +141,7 @@ mod imp {
             Ok(Self { pid, mem })
         }
 
-        pub fn regions(&mut self) -> Vec<Region> {
+        pub fn regions(&self) -> Vec<Region> {
             let Ok(maps) = std::fs::read_to_string(format!("/proc/{}/maps", self.pid)) else {
                 return Vec::new();
             };
@@ -159,9 +164,9 @@ mod imp {
                 .collect()
         }
 
-        pub fn read(&mut self, address: usize, buf: &mut [u8]) -> std::io::Result<()> {
-            self.mem.seek(SeekFrom::Start(address as u64))?;
-            self.mem.read_exact(buf)
+        /// Single `pread` per call instead of a seek followed by a read.
+        pub fn read(&self, address: usize, buf: &mut [u8]) -> std::io::Result<()> {
+            self.mem.read_exact_at(buf, address as u64)
         }
     }
 }
@@ -172,14 +177,9 @@ impl ProcessHandle {
     /// Reads `len` bytes at `address`, returning `None` if the read fails
     /// (e.g. the region became inaccessible, which can happen when racing a
     /// live, running process).
-    pub fn read_vec(&mut self, address: usize, len: usize) -> Option<Vec<u8>> {
+    pub fn read_vec(&self, address: usize, len: usize) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; len];
         self.read(address, &mut buf).ok().map(|()| buf)
-    }
-
-    pub fn read_u8(&mut self, address: usize) -> Option<u8> {
-        let mut buf = [0u8; 1];
-        self.read(address, &mut buf).ok().map(|()| buf[0])
     }
 
     /// Tries a handful of reads across different regions and returns the
@@ -188,7 +188,7 @@ impl ProcessHandle {
     /// blocking cross-process memory access (the common case when the
     /// target isn't a child process and the caller lacks `CAP_SYS_PTRACE`),
     /// without flagging a single unrelated unreadable page as the cause.
-    pub fn probe_read(&mut self) -> Result<(), std::io::Error> {
+    pub fn probe_read(&self) -> Result<(), std::io::Error> {
         let mut saw_permission_denied = None;
         for region in self.regions().into_iter().take(50) {
             let mut buf = [0u8; 1];
@@ -219,7 +219,7 @@ mod tests {
         static MARKER: [u8; 16] = *b"PROCESS_RW_TEST\0";
 
         let pid = std::process::id();
-        let mut handle = ProcessHandle::open(pid).expect("should open own process");
+        let handle = ProcessHandle::open(pid).expect("should open own process");
 
         let regions = handle.regions();
         assert!(!regions.is_empty(), "expected at least one readable region");
